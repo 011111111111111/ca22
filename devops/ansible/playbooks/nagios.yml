@@ -1,0 +1,194 @@
+---
+# Nagios monitoring server configuration
+- name: Configure Nagios Monitoring Server
+  hosts: monitoring_servers
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: Install Nagios dependencies
+      apt:
+        name:
+          - build-essential
+          - libgd-dev
+          - libssl-dev
+          - libc6-dev
+          - make
+          - gettext
+          - libmcrypt-dev
+          - libssl-dev
+          - wget
+          - unzip
+          - apache2
+          - php
+          - php-gd
+          - libgd-tools
+          - php-mysql
+          - sendmail
+          - libapache2-mod-php
+        state: present
+        update_cache: yes
+
+    - name: Create nagios user and group
+      user:
+        name: nagios
+        system: yes
+        shell: /bin/bash
+        home: /home/nagios
+        create_home: yes
+        groups: nagcmd
+
+    - name: Create nagcmd group
+      group:
+        name: nagcmd
+        system: yes
+
+    - name: Add nagios user to nagcmd group
+      user:
+        name: nagios
+        groups: nagcmd
+        append: yes
+
+    - name: Add www-data to nagcmd group
+      user:
+        name: www-data
+        groups: nagcmd
+        append: yes
+
+    - name: Download Nagios Core
+      get_url:
+        url: https://assets.nagios.com/downloads/nagioscore/releases/nagios-4.4.6.tar.gz
+        dest: /tmp/nagios-4.4.6.tar.gz
+        mode: '0644'
+
+    - name: Extract Nagios Core
+      unarchive:
+        src: /tmp/nagios-4.4.6.tar.gz
+        dest: /tmp
+        remote_src: yes
+
+    - name: Configure Nagios Core
+      shell: |
+        cd /tmp/nagios-4.4.6
+        ./configure --with-command-group=nagcmd
+      args:
+        creates: /tmp/nagios-4.4.6/Makefile
+
+    - name: Compile Nagios Core
+      shell: |
+        cd /tmp/nagios-4.4.6
+        make all
+      args:
+        creates: /usr/local/nagios/bin/nagios
+
+    - name: Install Nagios Core
+      shell: |
+        cd /tmp/nagios-4.4.6
+        make install
+        make install-init
+        make install-config
+        make install-commandmode
+        make install-webconf
+      args:
+        creates: /usr/local/nagios/etc/nagios.cfg
+
+    - name: Download Nagios Plugins
+      get_url:
+        url: https://nagios-plugins.org/download/nagios-plugins-2.3.3.tar.gz
+        dest: /tmp/nagios-plugins-2.3.3.tar.gz
+        mode: '0644'
+
+    - name: Extract Nagios Plugins
+      unarchive:
+        src: /tmp/nagios-plugins-2.3.3.tar.gz
+        dest: /tmp
+        remote_src: yes
+
+    - name: Configure Nagios Plugins
+      shell: |
+        cd /tmp/nagios-plugins-2.3.3
+        ./configure --with-nagios-user=nagios --with-nagios-group=nagios
+      args:
+        creates: /tmp/nagios-plugins-2.3.3/Makefile
+
+    - name: Compile and Install Nagios Plugins
+      shell: |
+        cd /tmp/nagios-plugins-2.3.3
+        make
+        make install
+      args:
+        creates: /usr/local/nagios/libexec/check_ping
+
+    - name: Create Nagios web admin user
+      htpasswd:
+        path: /usr/local/nagios/etc/htpasswd.users
+        name: "{{ nagios_admin_user }}"
+        password: "{{ nagios_admin_password }}"
+        owner: nagios
+        group: nagios
+        mode: '0640'
+
+    - name: Copy Nagios configuration files
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: nagios
+        group: nagios
+        mode: '0644'
+      loop:
+        - { src: '../templates/nagios.cfg.j2', dest: '/usr/local/nagios/etc/nagios.cfg' }
+        - { src: '../templates/commands.cfg.j2', dest: '/usr/local/nagios/etc/objects/commands.cfg' }
+        - { src: '../templates/contacts.cfg.j2', dest: '/usr/local/nagios/etc/objects/contacts.cfg' }
+        - { src: '../templates/timeperiods.cfg.j2', dest: '/usr/local/nagios/etc/objects/timeperiods.cfg' }
+        - { src: '../templates/templates.cfg.j2', dest: '/usr/local/nagios/etc/objects/templates.cfg' }
+
+    - name: Create hosts configuration directory
+      file:
+        path: /usr/local/nagios/etc/servers
+        state: directory
+        owner: nagios
+        group: nagios
+        mode: '0755'
+
+    - name: Copy host configuration templates
+      template:
+        src: '../templates/host.cfg.j2'
+        dest: '/usr/local/nagios/etc/servers/{{ item.name }}.cfg'
+        owner: nagios
+        group: nagios
+        mode: '0644'
+      loop:
+        - { name: 'app-server', ip: '{{ hostvars[groups["app_servers"][0]]["ansible_default_ipv4"]["address"] }}' }
+        - { name: 'db-server', ip: '{{ hostvars[groups["db_servers"][0]]["ansible_default_ipv4"]["address"] }}' }
+      when: groups['app_servers'] is defined and groups['db_servers'] is defined
+
+    - name: Validate Nagios configuration
+      command: /usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+      register: nagios_validate
+      changed_when: false
+
+    - name: Display validation results
+      debug:
+        var: nagios_validate.stdout_lines
+
+    - name: Enable and start Nagios service
+      systemd:
+        name: nagios
+        enabled: yes
+        state: started
+
+    - name: Enable and start Apache service
+      systemd:
+        name: apache2
+        enabled: yes
+        state: started
+
+    - name: Configure firewall for Nagios
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "80"    # HTTP
+        - "443"   # HTTPS
+

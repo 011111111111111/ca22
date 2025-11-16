@@ -1,0 +1,67 @@
+---
+# Database server configuration (MongoDB)
+- name: Configure MongoDB Database Server
+  hosts: db_servers
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: Import MongoDB GPG key
+      apt_key:
+        url: https://www.mongodb.org/static/pgp/server-7.0.asc
+        state: present
+
+    - name: Add MongoDB repository
+      apt_repository:
+        repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+        state: present
+        filename: mongodb-org-7.0
+
+    - name: Install MongoDB
+      apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
+
+    - name: Start and enable MongoDB service
+      systemd:
+        name: mongod
+        enabled: yes
+        state: started
+
+    - name: Configure MongoDB to listen on all interfaces
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backup: yes
+      loop:
+        - { regexp: '^  bindIp:', line: '  bindIp: 0.0.0.0' }
+        - { regexp: '^  port:', line: '  port: 27017' }
+      notify: restart mongodb
+
+    - name: Create MongoDB data directory
+      file:
+        path: /data/db
+        state: directory
+        owner: mongodb
+        group: mongodb
+        mode: '0755'
+
+    - name: Create MongoDB log directory
+      file:
+        path: /var/log/mongodb
+        state: directory
+        owner: mongodb
+        group: mongodb
+        mode: '0755'
+
+    - name: Install NRPE for Nagios monitoring
+      include_tasks: ../roles/nrpe/tasks/main.yml
+
+  handlers:
+    - name: restart mongodb
+      systemd:
+        name: mongod
+        state: restarted
+

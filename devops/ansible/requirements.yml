@@ -1,0 +1,14 @@
+---
+# Ansible Galaxy Requirements
+# Install with: ansible-galaxy install -r requirements.yml
+
+# Collections (if needed in future)
+# collections:
+#   - name: community.general
+#     version: ">=3.0.0"
+
+# Roles (if needed in future)
+# roles:
+#   - name: geerlingguy.mysql
+#     version: ">=3.0.0"
+

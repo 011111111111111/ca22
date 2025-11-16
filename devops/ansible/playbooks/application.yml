@@ -1,0 +1,99 @@
+---
+# Application server configuration
+- name: Configure Application Server
+  hosts: app_servers
+  become: yes
+  gather_facts: yes
+  vars:
+    app_user: wardrobe
+    app_dir: /opt/digital-wardrobe
+    app_port: 3000
+
+  tasks:
+    - name: Install Node.js dependencies
+      apt:
+        name:
+          - build-essential
+          - python3
+          - python3-pip
+        state: present
+
+    - name: Add NodeSource repository for Node.js
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version | default('20.x') }} | bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Install application dependencies
+      npm:
+        path: "{{ app_dir }}"
+        state: present
+      when: app_dir is defined
+
+    - name: Create environment file
+      template:
+        src: ../templates/app.env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+      vars:
+        mongodb_connection: "mongodb://{{ hostvars[groups['db_servers'][0]]['ansible_default_ipv4']['address'] }}:27017/Digital_Wardrobe"
+        s3_bucket: "{{ s3_bucket_name }}"
+        app_port: "{{ app_port }}"
+        node_env: production
+
+    - name: Build Next.js application
+      shell: |
+        cd {{ app_dir }}
+        npm run build
+      become_user: "{{ app_user }}"
+      when: app_dir is defined
+
+    - name: Create PM2 ecosystem file
+      template:
+        src: ../templates/ecosystem.config.js.j2
+        dest: "{{ app_dir }}/ecosystem.config.js"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+
+    - name: Start application with PM2
+      shell: |
+        cd {{ app_dir }}
+        pm2 start ecosystem.config.js
+        pm2 save
+        pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }}
+      become_user: "{{ app_user }}"
+
+    - name: Configure Nginx as reverse proxy
+      include_tasks: ../roles/nginx/tasks/main.yml
+      vars:
+        server_name: "{{ app_domain | default('localhost') }}"
+        proxy_pass: "http://localhost:{{ app_port }}"
+
+    - name: Install NRPE for Nagios monitoring
+      include_tasks: ../roles/nrpe/tasks/main.yml
+
+    - name: Configure firewall for application
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "80"    # HTTP
+        - "443"   # HTTPS
+        - "{{ app_port }}"  # Application port
+

@@ -1,0 +1,92 @@
+---
+# NRPE (Nagios Remote Plugin Executor) installation and configuration
+- name: Install NRPE dependencies
+  apt:
+    name:
+      - build-essential
+      - libssl-dev
+    state: present
+    update_cache: yes
+  ignore_errors: yes
+
+- name: Try to install libnagios-plugin-perl (optional)
+  apt:
+    name: libnagios-plugin-perl
+    state: present
+  ignore_errors: yes
+  failed_when: false
+
+- name: Download NRPE source
+  get_url:
+    url: https://github.com/NagiosEnterprises/nrpe/releases/download/nrpe-4.1.0/nrpe-4.1.0.tar.gz
+    dest: /tmp/nrpe-4.1.0.tar.gz
+    mode: '0644'
+
+- name: Extract NRPE source
+  unarchive:
+    src: /tmp/nrpe-4.1.0.tar.gz
+    dest: /tmp
+    remote_src: yes
+
+- name: Configure NRPE
+  shell: |
+    cd /tmp/nrpe-4.1.0
+    ./configure --enable-command-args --with-nagios-user=nagios --with-nagios-group=nagios --with-ssl=/usr/bin/openssl --with-ssl-lib=/usr/lib/x86_64-linux-gnu
+  args:
+    creates: /tmp/nrpe-4.1.0/Makefile
+
+- name: Compile NRPE
+  shell: |
+    cd /tmp/nrpe-4.1.0
+    make all
+  args:
+    creates: /tmp/nrpe-4.1.0/src/nrpe
+
+- name: Install NRPE
+  shell: |
+    cd /tmp/nrpe-4.1.0
+    make install
+    make install-plugin
+    make install-daemon
+    make install-daemon-config
+    make install-xinetd
+  args:
+    creates: /usr/local/nagios/etc/nrpe.cfg
+
+- name: Create nagios user if it doesn't exist
+  user:
+    name: nagios
+    system: yes
+    shell: /sbin/nologin
+    home: /var/lib/nagios
+    create_home: yes
+
+- name: Configure NRPE
+  template:
+    src: ../../templates/nrpe.cfg.j2
+    dest: /usr/local/nagios/etc/nrpe.cfg
+    owner: root
+    group: root
+    mode: '0644'
+  vars:
+    nagios_server_ip: "{{ hostvars[groups['monitoring_servers'][0]]['ansible_default_ipv4']['address'] }}"
+  when: groups['monitoring_servers'] is defined
+
+- name: Create systemd service for NRPE
+  template:
+    src: ../../templates/nrpe.service.j2
+    dest: /etc/systemd/system/nrpe.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Enable and start NRPE service
+  systemd:
+    name: nrpe
+    enabled: yes
+    state: started
+
