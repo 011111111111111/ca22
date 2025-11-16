@@ -1,58 +1,27 @@
 ---
-# Common configuration for all servers
-- name: Configure common settings for all servers
+- name: Common setup for all servers
   hosts: all
   become: yes
-  gather_facts: yes
 
   tasks:
-    - name: Install common packages
+    - name: Install common utilities
       apt:
         name:
           - curl
           - wget
           - git
-          - vim
+          - unzip
           - htop
           - net-tools
-          - unzip
-          - software-properties-common
-          - apt-transport-https
-          - ca-certificates
-          - gnupg
-          - lsb-release
+          - vim
         state: present
         update_cache: yes
-
-    - name: Set timezone
-      timezone:
-        name: UTC
-
-    - name: Configure firewall (UFW)
-      ufw:
-        rule: allow
-        port: "{{ item }}"
-        proto: tcp
-      loop:
-        - "22"    # SSH
-      when: ansible_os_family == "Debian"
 
     - name: Create application user
       user:
         name: wardrobe
         shell: /bin/bash
         create_home: yes
-        groups: sudo
-        append: yes
-
-    - name: Setup SSH key for application user
-      authorized_key:
-        user: wardrobe
-        state: present
-        key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
-      when: lookup('file', '~/.ssh/id_rsa.pub', errors='ignore') != ''
-      ignore_errors: yes
-      failed_when: false
 
     - name: Create application directories
       file:
@@ -60,9 +29,7 @@
         state: directory
         owner: wardrobe
         group: wardrobe
-        mode: '0755'
+        mode: "0755"
       loop:
         - /opt/digital-wardrobe
-        - /opt/digital-wardrobe/logs
         - /var/log/digital-wardrobe
-

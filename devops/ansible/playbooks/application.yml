@@ -4,23 +4,28 @@
   hosts: app_servers
   become: yes
   gather_facts: yes
+  
   vars:
     app_user: wardrobe
     app_dir: /opt/digital-wardrobe
+    backend_dir: /opt/digital-wardrobe/backend
     app_port: 3000
 
   tasks:
-    - name: Install Node.js dependencies
+    - name: Install OS dependencies
       apt:
         name:
+          - git
           - build-essential
+          - curl
+          - nginx
           - python3
           - python3-pip
         state: present
+        update_cache: yes
 
-    - name: Add NodeSource repository for Node.js
-      shell: |
-        curl -fsSL https://deb.nodesource.com/setup_{{ node_version | default('20.x') }} | bash -
+    - name: Install NodeSource (Node 20.x)
+      shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
       args:
         creates: /etc/apt/sources.list.d/nodesource.list
 
@@ -36,56 +41,163 @@
         global: yes
         state: present
 
-    - name: Install application dependencies
+    - name: Install tsx globally
       npm:
-        path: "{{ app_dir }}"
+        name: tsx
+        global: yes
         state: present
-      when: app_dir is defined
+
+    - name: Remove existing application directory
+      shell: |
+        rm -rf {{ app_dir }}
+        sleep 1
+      ignore_errors: yes
+
+    - name: Clone repository fresh
+      git:
+        repo: https://github.com/011111111111111/ca22.git
+        dest: "{{ app_dir }}"
+        version: main
+        force: yes
+
+    - name: Set ownership of application directory
+      file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: Install backend dependencies as root then fix ownership
+      shell: |
+        cd {{ backend_dir }}
+        npm install
+        chown -R {{ app_user }}:{{ app_user }} {{ app_dir }}
+      args:
+        chdir: "{{ backend_dir }}"
 
     - name: Create environment file
-      template:
-        src: ../templates/app.env.j2
-        dest: "{{ app_dir }}/.env"
+      copy:
+        content: |
+          NODE_ENV=production
+          PORT={{ app_port }}
+          MONGODB_URI=mongodb://{{ hostvars[groups['db_servers'][0]]['ansible_default_ipv4']['address'] }}:27017/Digital_Wardrobe
+          DATABASE_URL=mongodb://{{ hostvars[groups['db_servers'][0]]['ansible_default_ipv4']['address'] }}:27017/Digital_Wardrobe
+          AWS_REGION=ap-south-1
+          S3_BUCKET_NAME=digital-wardrobe-storage-1ab64305
+          APP_URL=http://65.2.142.108:{{ app_port }}
+          API_URL=http://65.2.142.108:{{ app_port }}/api
+          NEXT_PUBLIC_API_URL=http://65.2.142.108:{{ app_port }}/api
+        dest: "{{ backend_dir }}/.env"
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         mode: '0600'
-      vars:
-        mongodb_connection: "mongodb://{{ hostvars[groups['db_servers'][0]]['ansible_default_ipv4']['address'] }}:27017/Digital_Wardrobe"
-        s3_bucket: "{{ s3_bucket_name }}"
-        app_port: "{{ app_port }}"
-        node_env: production
 
-    - name: Build Next.js application
+    - name: Build Next.js application (as root, then fix ownership)
       shell: |
-        cd {{ app_dir }}
-        npm run build
-      become_user: "{{ app_user }}"
-      when: app_dir is defined
+        cd {{ backend_dir }}
+        export NODE_ENV=production
+        export PATH=/usr/bin:/usr/local/bin:$PATH
+        /usr/bin/npm run build
+        chown -R {{ app_user }}:{{ app_user }} {{ app_dir }}
+      environment:
+        NODE_ENV: production
+        PATH: "/usr/bin:/usr/local/bin:{{ ansible_env.PATH }}"
 
-    - name: Create PM2 ecosystem file
-      template:
-        src: ../templates/ecosystem.config.js.j2
-        dest: "{{ app_dir }}/ecosystem.config.js"
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
+    - name: Kill all processes on port 3000
+      shell: |
+        sudo -u {{ app_user }} pm2 delete all || true
+        sudo -u {{ app_user }} pm2 kill || true
+        sudo fuser -k 3000/tcp 2>/dev/null || true
+        sudo lsof -ti:3000 | xargs sudo kill -9 2>/dev/null || true
+        sleep 2
+      ignore_errors: yes
+
+    - name: Fix server.ts to always listen on 0.0.0.0
+      shell: |
+        cd {{ backend_dir }}
+        sed -i "s/const hostname = dev ? 'localhost' : '0\.0\.0\.0';/const hostname = '0.0.0.0';/" server.ts || true
+      ignore_errors: yes
+
+    - name: Start backend using tsx + PM2 (using sudo to avoid ACL issues)
+      shell: |
+        cd {{ backend_dir }}
+        export NODE_ENV=production
+        export PORT={{ app_port }}
+        export PATH=/usr/bin:/usr/local/bin:$PATH
+        sudo -u {{ app_user }} pm2 delete digital-wardrobe || true
+        sleep 2
+        sudo -u {{ app_user }} pm2 start server.ts --interpreter tsx --name digital-wardrobe --cwd {{ backend_dir }} --update-env
+        sudo -u {{ app_user }} pm2 save
+        sleep 15
+        sudo -u {{ app_user }} pm2 list
+      environment:
+        NODE_ENV: production
+        PORT: "{{ app_port }}"
+        PATH: "/usr/bin:/usr/local/bin:{{ ansible_env.PATH }}"
+
+    - name: Setup PM2 startup script (using sudo to avoid ACL issues)
+      shell: |
+        sudo -u {{ app_user }} pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }} || true
+      ignore_errors: yes
+
+    - name: Configure Nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/digital-wardrobe
+        content: |
+          server {
+            listen 80;
+            server_name _;
+            
+            client_max_body_size 50M;
+            
+            location / {
+              proxy_pass http://localhost:{{ app_port }};
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection 'upgrade';
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_cache_bypass $http_upgrade;
+              proxy_read_timeout 300s;
+              proxy_connect_timeout 75s;
+            }
+            
+            location /api {
+              proxy_pass http://localhost:{{ app_port }};
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+          }
+        owner: root
+        group: root
         mode: '0644'
 
-    - name: Start application with PM2
-      shell: |
-        cd {{ app_dir }}
-        pm2 start ecosystem.config.js
-        pm2 save
-        pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }}
-      become_user: "{{ app_user }}"
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/digital-wardrobe
+        dest: /etc/nginx/sites-enabled/digital-wardrobe
+        state: link
+        force: yes
 
-    - name: Configure Nginx as reverse proxy
-      include_tasks: ../roles/nginx/tasks/main.yml
-      vars:
-        server_name: "{{ app_domain | default('localhost') }}"
-        proxy_pass: "http://localhost:{{ app_port }}"
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
 
-    - name: Install NRPE for Nagios monitoring
-      include_tasks: ../roles/nrpe/tasks/main.yml
+    - name: Test Nginx configuration
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+      when: nginx_test.rc == 0
 
     - name: Configure firewall for application
       ufw:
@@ -93,7 +205,15 @@
         port: "{{ item }}"
         proto: tcp
       loop:
-        - "80"    # HTTP
-        - "443"   # HTTPS
-        - "{{ app_port }}"  # Application port
+        - "80"
+        - "443"
+        - "{{ app_port }}"
 
+    - name: Verify PM2 is running (using sudo to avoid ACL issues)
+      shell: sudo -u {{ app_user }} pm2 list
+      register: pm2_status
+      changed_when: false
+
+    - name: Display PM2 status
+      debug:
+        var: pm2_status.stdout_lines
